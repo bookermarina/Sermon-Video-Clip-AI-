@@ -1,9 +1,18 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI, Modality, GenerateContentResponse, Type } from "@google/genai";
 
 // --- Types ---
+declare global {
+  interface Window {
+    aistudio: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
+
 type AspectRatio = '9:16' | '16:9';
 type Resolution = '720p' | '1080p';
 type Voice = 'male' | 'female';
@@ -133,6 +142,49 @@ type SubtitleSegment = {
   end: number;
 };
 
+type VideoClip = {
+  id: string;
+  url: string;
+  prompt: string;
+};
+
+// --- Helper Functions ---
+
+// Robust JSON Parsing for LLM Responses
+function safeParseJSON<T>(text: string | undefined): T | null {
+  if (!text) return null;
+  
+  let clean = text.trim();
+  
+  // Remove markdown code blocks
+  clean = clean.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
+  
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    // If strict parsing fails, try to extract array or object using regex
+    console.warn("JSON strict parse failed, attempting extraction...", e);
+    
+    // Try to find the outermost array
+    const arrayMatch = clean.match(/\[[\s\S]*\]/);
+    if (arrayMatch) {
+      try {
+        return JSON.parse(arrayMatch[0]);
+      } catch (e2) { /* ignore */ }
+    }
+    
+    // Try to find the outermost object
+    const objectMatch = clean.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      try {
+        return JSON.parse(objectMatch[0]);
+      } catch (e2) { /* ignore */ }
+    }
+    
+    return null;
+  }
+}
+
 // --- Audio Helpers ---
 function base64ToUint8Array(base64: string) {
   const binaryString = atob(base64);
@@ -227,6 +279,27 @@ const createSmartSubtitles = (fullText: string, totalDuration: number): Subtitle
     return segment;
   });
 };
+
+// --- Async Utils for Rate Limiting ---
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function retryOperation<T>(operation: () => Promise<T>, retries = 5, backoff = 5000): Promise<T> {
+  try {
+    return await operation();
+  } catch (error: any) {
+    // Check for 429 or common rate limit messages
+    const isRateLimit = error?.status === 429 || error?.code === 429 || 
+                        (error?.message && (error.message.includes('429') || error.message.includes('quota') || error.message.includes('RESOURCE_EXHAUSTED')));
+    
+    if (isRateLimit && retries > 0) {
+      console.warn(`Rate limit hit. Retrying in ${backoff}ms... (${retries} retries left)`);
+      await delay(backoff);
+      // Exponential backoff with a cap
+      return retryOperation(operation, retries - 1, Math.min(backoff * 1.5, 20000));
+    }
+    throw error;
+  }
+}
 
 // --- Sub-components ---
 
@@ -555,6 +628,138 @@ const Suggestion = ({ data, onApply }: { data: any, onApply: (c: any) => void })
   </div>
 );
 
+// --- Timeline Editor Component ---
+const TimelineEditor = ({ 
+  clips, 
+  currentClipIndex, 
+  onClipSelect, 
+  onReorder, 
+  onRegenerate,
+  onSuggest,
+  isRegeneratingIndex
+}: { 
+  clips: VideoClip[], 
+  currentClipIndex: number, 
+  onClipSelect: (idx: number) => void,
+  onReorder: (from: number, to: number) => void,
+  onRegenerate: (idx: number, prompt: string) => void,
+  onSuggest: (idx: number) => void,
+  isRegeneratingIndex: number | null
+}) => {
+    const [editingPromptIndex, setEditingPromptIndex] = useState<number | null>(null);
+    const [tempPrompt, setTempPrompt] = useState("");
+
+    return (
+        <div className="w-full mt-4 bg-gray-900 border-t border-gray-800 p-4">
+             <div className="flex items-center justify-between mb-2">
+                 <h4 className="text-xs uppercase tracking-wider text-gray-400 font-semibold">Timeline Editor</h4>
+                 <span className="text-xs text-gray-500">{clips.length} clips in sequence</span>
+             </div>
+             <div className="flex gap-4 overflow-x-auto pb-4 scrollbar-thin">
+                 {clips.map((clip, idx) => (
+                     <div 
+                        key={clip.id} 
+                        className={`flex-shrink-0 w-40 flex flex-col gap-2 transition-all ${idx === currentClipIndex ? 'opacity-100' : 'opacity-60 hover:opacity-100'}`}
+                     >
+                         <div 
+                            className={`relative aspect-video bg-gray-800 rounded-md overflow-hidden border-2 cursor-pointer ${idx === currentClipIndex ? 'border-blue-500' : 'border-transparent'}`}
+                            onClick={() => onClipSelect(idx)}
+                         >
+                             {isRegeneratingIndex === idx ? (
+                                 <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                                     <i className="fas fa-spinner fa-spin text-white"></i>
+                                 </div>
+                             ) : (
+                                <video 
+                                  src={clip.url} 
+                                  className="w-full h-full object-cover" 
+                                  muted 
+                                  playsInline 
+                                  preload="metadata" // Only load metadata to save resources
+                                />
+                             )}
+                             <div className="absolute top-1 left-1 bg-black/70 px-1.5 py-0.5 rounded text-[10px] text-white">
+                                 #{idx + 1}
+                             </div>
+                         </div>
+                         
+                         {/* Controls */}
+                         <div className="flex items-center justify-between gap-1">
+                             <div className="flex gap-1">
+                                <button 
+                                    disabled={idx === 0}
+                                    onClick={(e) => { e.stopPropagation(); onReorder(idx, idx - 1); }}
+                                    className="w-6 h-6 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white disabled:opacity-30 flex items-center justify-center"
+                                    title="Move Left"
+                                >
+                                    <i className="fas fa-chevron-left text-[10px]"></i>
+                                </button>
+                                <button 
+                                    disabled={idx === clips.length - 1}
+                                    onClick={(e) => { e.stopPropagation(); onReorder(idx, idx + 1); }}
+                                    className="w-6 h-6 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white disabled:opacity-30 flex items-center justify-center"
+                                    title="Move Right"
+                                >
+                                    <i className="fas fa-chevron-right text-[10px]"></i>
+                                </button>
+                             </div>
+                             
+                             <div className="flex gap-1">
+                                <button
+                                    onClick={() => onSuggest(idx)}
+                                    className="w-6 h-6 rounded bg-indigo-900/50 hover:bg-indigo-700 text-indigo-300 hover:text-white flex items-center justify-center"
+                                    title="AI Suggestion"
+                                >
+                                     <i className="fas fa-magic text-[10px]"></i>
+                                </button>
+                                <button 
+                                    onClick={() => {
+                                        setEditingPromptIndex(idx);
+                                        setTempPrompt(clip.prompt);
+                                    }}
+                                    className="w-6 h-6 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white flex items-center justify-center"
+                                    title="Edit Prompt"
+                                >
+                                    <i className="fas fa-pencil-alt text-[10px]"></i>
+                                </button>
+                             </div>
+                         </div>
+
+                         {/* Prompt Editor Overlay */}
+                         {editingPromptIndex === idx && (
+                             <div className="absolute inset-0 bg-black/90 z-50 flex flex-col p-4 rounded-md">
+                                 <h5 className="text-xs font-bold text-gray-300 mb-2">Edit Prompt #{idx+1}</h5>
+                                 <textarea 
+                                    value={tempPrompt}
+                                    onChange={(e) => setTempPrompt(e.target.value)}
+                                    className="flex-1 bg-gray-800 text-[10px] p-2 rounded border border-gray-700 mb-2 resize-none focus:outline-none focus:border-blue-500"
+                                 />
+                                 <div className="flex gap-2">
+                                     <button 
+                                        onClick={() => setEditingPromptIndex(null)}
+                                        className="flex-1 py-1 bg-gray-700 text-[10px] rounded hover:bg-gray-600"
+                                     >
+                                         Cancel
+                                     </button>
+                                     <button 
+                                        onClick={() => {
+                                            onRegenerate(idx, tempPrompt);
+                                            setEditingPromptIndex(null);
+                                        }}
+                                        className="flex-1 py-1 bg-blue-600 text-[10px] rounded hover:bg-blue-500"
+                                     >
+                                         Regen
+                                     </button>
+                                 </div>
+                             </div>
+                         )}
+                     </div>
+                 ))}
+             </div>
+        </div>
+    );
+}
+
 // --- Main App ---
 
 const App = () => {
@@ -564,8 +769,25 @@ const App = () => {
     { id: '2', role: 'assistant', type: 'source-input' }
   ]);
   const [step, setStep] = useState<'source' | 'quote' | 'voice' | 'theme' | 'mood' | 'format' | 'text' | 'confirm' | 'generating' | 'done'>('source');
-  
-  // Configuration State
+  const [needsApiKey, setNeedsApiKey] = useState(false);
+
+  // Check for API Key on mount
+  useEffect(() => {
+    const checkKey = async () => {
+      if (window.aistudio) {
+        const hasKey = await window.aistudio.hasSelectedApiKey();
+        setNeedsApiKey(!hasKey);
+      }
+    };
+    checkKey();
+  }, []);
+
+  const handleConnectKey = async () => {
+    if (window.aistudio) {
+      await window.aistudio.openSelectKey();
+      setNeedsApiKey(false); // Assume success per guidelines to mitigate race condition
+    }
+  };
   const [config, setConfig] = useState({
     quote: '',
     voice: 'male' as Voice,
@@ -584,9 +806,11 @@ const App = () => {
   // Generation State
   const [loading, setLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('');
+  const [isExporting, setIsExporting] = useState(false);
+  const [isRegeneratingIndex, setIsRegeneratingIndex] = useState<number | null>(null);
   
   // Refactored Video Data to support Dynamic Asset Sequencing
-  const [videoData, setVideoData] = useState<{ sequence: string[], audioUrl: string, subtitles: SubtitleSegment[] } | null>(null);
+  const [videoData, setVideoData] = useState<{ clips: VideoClip[], audioUrl: string, subtitles: SubtitleSegment[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   
   // Playback State
@@ -598,8 +822,9 @@ const App = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const exportCanvasRef = useRef<HTMLCanvasElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
-
+  
   // Scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -620,7 +845,7 @@ const App = () => {
 
   const handleVideoEnded = () => {
     // Dynamic Asset Sequencing Logic
-    if (videoData && currentClipIndex < videoData.sequence.length - 1) {
+    if (videoData && currentClipIndex < videoData.clips.length - 1) {
       // Advance to next clip in sequence
       setCurrentClipIndex(prev => prev + 1);
       // Note: The useEffect on currentClipIndex will trigger play()
@@ -638,6 +863,10 @@ const App = () => {
   }, [currentClipIndex]);
   
   const handleAudioEnded = () => {
+     // CRITICAL FIX: If we are exporting, DO NOT reset playback. 
+     // The MediaRecorder needs to see the audio element reach the end naturally.
+     if (isExporting) return;
+
      if(audioRef.current) {
         audioRef.current.currentTime = 0;
      }
@@ -649,6 +878,318 @@ const App = () => {
      }
      setIsPlaying(false);
      setCurrentTime(0);
+  }
+
+  // --- Timeline Actions ---
+
+  const handleReorderClips = (fromIndex: number, toIndex: number) => {
+      if (!videoData) return;
+      const newClips = [...videoData.clips];
+      const [movedClip] = newClips.splice(fromIndex, 1);
+      newClips.splice(toIndex, 0, movedClip);
+      setVideoData({ ...videoData, clips: newClips });
+      
+      // If currently playing moved clip, follow it. If not, try to stay on same visual index or reset
+      if (currentClipIndex === fromIndex) setCurrentClipIndex(toIndex);
+  };
+
+  const handleRegenerateClip = async (index: number, newPrompt: string) => {
+      if (!videoData) return;
+      
+      // Check key before Veo call
+      if (window.aistudio && !(await window.aistudio.hasSelectedApiKey())) {
+        setNeedsApiKey(true);
+        return;
+      }
+
+      setIsRegeneratingIndex(index);
+      
+      try {
+          const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+          
+          // Generate new video with robust retry logic
+          const videoUrl = await retryOperation(async () => {
+             let videoOp = await ai.models.generateVideos({
+              model: 'veo-3.1-fast-generate-preview',
+              prompt: newPrompt,
+              config: {
+                numberOfVideos: 1,
+                resolution: config.resolution,
+                aspectRatio: config.aspectRatio
+              }
+            });
+
+            // Poll Video
+            let operation = videoOp;
+            while (operation.done !== true) {
+               await delay(5000); // Polling delay
+               operation = await ai.operations.getVideosOperation({ operation: operation });
+            }
+            
+            if (operation.error) throw new Error(String(operation.error.message));
+            
+            const videoUri = operation.response?.generatedVideos?.[0]?.video?.uri;
+            if (!videoUri) throw new Error("Missing video URI");
+
+            const vidRes = await fetch(`${videoUri}&key=${process.env.API_KEY}`);
+            if (!vidRes.ok) throw new Error("Failed to download video bytes");
+            const vidBlob = await vidRes.blob();
+            return URL.createObjectURL(vidBlob);
+          }, 3, 5000); // 3 Retries for edits
+
+          // Update state
+          const newClips = [...videoData.clips];
+          newClips[index] = { 
+              ...newClips[index], 
+              url: videoUrl, 
+              prompt: newPrompt,
+              id: Date.now().toString() // force refresh
+          };
+          setVideoData({ ...videoData, clips: newClips });
+
+      } catch (e) {
+          console.error("Failed to regenerate clip", e);
+          alert("Failed to regenerate clip. Please try again later.");
+      } finally {
+          setIsRegeneratingIndex(null);
+      }
+  };
+
+  const handleAISuggestion = async (index: number) => {
+      if (!videoData) return;
+      setIsRegeneratingIndex(index); // Show loading on the card
+      
+      try {
+          const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+          const prevPrompt = index > 0 ? videoData.clips[index - 1].prompt : "Start of video";
+          const nextPrompt = index < videoData.clips.length - 1 ? videoData.clips[index + 1].prompt : "End of video";
+          const currentPrompt = videoData.clips[index].prompt;
+          
+          const prompt = `
+            Context: A video sequence for a sermon clip.
+            Quote: "${config.quote}"
+            Theme: ${config.themeId}
+            
+            Current Prompt Sequence:
+            - Previous: ${prevPrompt}
+            - Current (To Replace): ${currentPrompt}
+            - Next: ${nextPrompt}
+            
+            Task: Write a SINGLE better visual prompt for the "Current" slot that bridges the previous and next shots smoothly.
+            Return ONLY the raw string of the new prompt.
+          `;
+          
+          const response = await ai.models.generateContent({
+              model: 'gemini-3-flash-preview',
+              contents: `Suggest a better visual prompt for this slot. Prev: ${prevPrompt}, Current: ${currentPrompt}, Next: ${nextPrompt}. Quote: "${config.quote}"`,
+              config: { 
+                systemInstruction: "Return ONLY the raw string of the new prompt. Keep it consistent with the theme.",
+                maxOutputTokens: 256 
+              }
+          });
+          
+          const newPrompt = response.text?.trim() || currentPrompt;
+          
+          // Trigger regeneration with new prompt
+          await handleRegenerateClip(index, newPrompt);
+          
+      } catch (e) {
+          console.error("AI suggestion failed", e);
+          setIsRegeneratingIndex(null);
+      }
+  };
+  
+  // --- Export Logic ---
+  const handleExport = async () => {
+    if (!videoData || !videoRef.current || !audioRef.current || !exportCanvasRef.current) return;
+    
+    setIsExporting(true);
+    // Pause existing playback
+    if (isPlaying) togglePlay();
+    
+    // Setup Canvas
+    const canvas = exportCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if(!ctx) return;
+
+    // Dimensions based on config
+    const width = config.aspectRatio === '9:16' ? 720 : 1280;
+    const height = config.aspectRatio === '9:16' ? 1280 : 720;
+    
+    // Scale up for 1080p roughly (internal rendering)
+    const scale = config.resolution === '1080p' ? 1.5 : 1;
+    canvas.width = width * scale;
+    canvas.height = height * scale;
+
+    // Helper to wrap text
+    const getLines = (text: string, maxWidth: number) => {
+        const words = text.split(" ");
+        const lines = [];
+        let currentLine = words[0];
+        for (let i = 1; i < words.length; i++) {
+            const word = words[i];
+            const width = ctx.measureText(currentLine + " " + word).width;
+            if (width < maxWidth) {
+                currentLine += " " + word;
+            } else {
+                lines.push(currentLine);
+                currentLine = word;
+            }
+        }
+        lines.push(currentLine);
+        return lines;
+    };
+
+    // Setup Media Stream
+    const stream = canvas.captureStream(30); // 30 FPS
+    
+    // Setup Audio for Recording
+    let audioCtx: AudioContext | undefined;
+    let source: MediaElementAudioSourceNode | undefined;
+
+    try {
+      // Connect audio element to recording destination
+      audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      source = audioCtx.createMediaElementSource(audioRef.current);
+      const dest = audioCtx.createMediaStreamDestination();
+      source.connect(dest);
+      source.connect(audioCtx.destination); // Play through speakers so user can hear
+
+      const combinedStream = new MediaStream([
+         ...stream.getVideoTracks(),
+         ...dest.stream.getAudioTracks()
+      ]);
+      
+      const chunks: BlobPart[] = [];
+      const recorder = new MediaRecorder(combinedStream, { 
+        mimeType: 'video/webm; codecs=vp9'
+      });
+      
+      // Failsafe: Stop recording if it goes way over expected duration (e.g. stuck)
+      // audioDuration + 5s buffer
+      const maxDurationMs = (duration * 1000) + 5000;
+      const failsafeTimeout = setTimeout(() => {
+          if (recorder.state === 'recording') {
+              console.warn("Export timed out, forcing stop.");
+              recorder.stop();
+          }
+      }, Math.max(maxDurationMs, 10000)); // Minimum 10s wait
+
+      recorder.ondataavailable = (e) => {
+        if(e.data.size > 0) chunks.push(e.data);
+      };
+      
+      recorder.onstop = () => {
+        clearTimeout(failsafeTimeout);
+        const blob = new Blob(chunks, { type: 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `sermon_clip_${Date.now()}.webm`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        
+        setIsExporting(false);
+        setIsPlaying(false);
+        // Clean up audio graph
+        if (source) source.disconnect();
+        if (audioCtx) audioCtx.close();
+      };
+      
+      // Start Recording Sequence
+      recorder.start();
+      
+      // Reset Playback
+      setCurrentClipIndex(0);
+      videoRef.current.currentTime = 0;
+      audioRef.current.currentTime = 0;
+      
+      // Trigger play
+      // Need to wait slightly for play promise
+      await videoRef.current.play();
+      await audioRef.current.play();
+      setIsPlaying(true);
+      
+      // Drawing Loop
+      const draw = () => {
+         if (!videoRef.current || !ctx || !videoData || recorder.state === 'inactive') return;
+         
+         // Stop if audio ended
+         if (audioRef.current?.ended) {
+            recorder.stop();
+            return;
+         }
+         
+         // Draw Video
+         ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+         
+         // Draw Text Overlay
+         if (config.textOverlay.enabled) {
+            ctx.fillStyle = 'white';
+            ctx.textAlign = 'center';
+            ctx.shadowColor = 'rgba(0,0,0,0.8)';
+            ctx.shadowBlur = 10 * scale;
+            ctx.shadowOffsetX = 2 * scale;
+            ctx.shadowOffsetY = 2 * scale;
+            
+            let textToDraw = "";
+            if (config.textOverlay.mode === 'static') {
+              textToDraw = `"${config.quote}"`;
+            } else {
+               // Find current subtitle
+               const t = audioRef.current?.currentTime || 0;
+               const seg = videoData.subtitles.find(s => t >= s.start && t <= s.end);
+               textToDraw = seg ? seg.text : "";
+            }
+            
+            if (textToDraw) {
+               // Font Config
+               let fontSize = config.aspectRatio === '9:16' ? 40 : 50;
+               fontSize = fontSize * scale;
+               
+               let fontFamily = 'sans-serif';
+               if (config.textOverlay.style === 'classic') fontFamily = 'serif';
+               if (config.textOverlay.style === 'handwritten') fontFamily = 'cursive';
+               
+               ctx.font = `bold ${fontSize}px ${fontFamily}`;
+               
+               // Wrap
+               const maxWidth = canvas.width * 0.8;
+               const lines = getLines(textToDraw, maxWidth);
+               
+               // Position
+               let y = canvas.height / 2;
+               if (config.textOverlay.position === 'bottom') {
+                  y = canvas.height - (lines.length * fontSize * 1.5) - (100 * scale);
+               } else {
+                  // Center vertically based on number of lines
+                  y = (canvas.height / 2) - ((lines.length * fontSize * 1.2) / 2);
+               }
+               
+               lines.forEach((line, i) => {
+                 ctx.fillText(line, canvas.width / 2, y + (i * fontSize * 1.3));
+               });
+            }
+         }
+         
+         requestAnimationFrame(draw);
+      };
+      
+      draw();
+    } catch (e) {
+      console.error("Export failed", e);
+      setIsExporting(false);
+      setIsPlaying(false);
+      if (source) source.disconnect();
+      if (audioCtx) audioCtx.close();
+      alert("Failed to export video. Please try again.");
+    }
+  };
+
+  const cancelExport = () => {
+      // Force reload to clear any weird audio context states if stuck
+      window.location.reload(); 
   }
 
   const getCurrentSubtitle = () => {
@@ -669,45 +1210,55 @@ const App = () => {
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      const prompt = `
-        Analyze the following input text: "${input.substring(0, 20000)}... (truncated if too long)".
-        
-        Task:
-        1. If the input is a long transcript/sermon: Extract 5-6 powerful, viral-worthy, emotionally resonant quotes suitable for a short social media video.
-        2. If the input is a short text (likely a direct quote): Simply clean it up if needed and return it as the single option.
-        
-        CRITICAL RULES:
-        1. QUOTES MUST BE VERBATIM from the text provided.
-        2. Focus on "Biblical Truths" or "Inspiring Messages".
-        
-        Return ONLY a JSON array of objects with key: "text" (string).
-        Example: [{"text": "Faith is not about everything turning out okay..."}]
-        Do not include markdown code blocks.
-      `;
-
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt
+        model: 'gemini-3-flash-preview',
+        contents: `Analyze this text: "${input.substring(0, 10000)}"`,
+        config: { 
+            systemInstruction: "You are a sermon analyst. If the input appears to be a specific quote the user wants to use (regardless of length), return ONLY that quote as the single item in a JSON array. If the input is a long transcript, extract 3-4 powerful, viral-worthy, verbatim quotes for social media.",
+            maxOutputTokens: 1024,
+            responseMimeType: "application/json",
+            responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                    type: Type.OBJECT,
+                    properties: {
+                        text: { type: Type.STRING }
+                    },
+                    required: ["text"]
+                }
+            }
+        }
       });
 
-      let cleanText = response.text?.trim() || "[]";
-      if (cleanText.startsWith('```json')) {
-        cleanText = cleanText.replace(/```json/g, '').replace(/```/g, '');
-      } else if (cleanText.startsWith('```')) {
-        cleanText = cleanText.replace(/```/g, '');
+      const quotes = safeParseJSON<QuoteData[]>(response.text);
+      
+      if (!quotes || !Array.isArray(quotes)) {
+          throw new Error("Failed to parse quotes from AI response.");
       }
+      
+      addMessage({ id: Date.now().toString(), role: 'user', type: 'text', content: input.length > 100 ? "Text uploaded" : `Input: "${input}"` });
 
-      const quotes = JSON.parse(cleanText);
-      
-      setStep('quote');
-      
-      addMessage({ id: Date.now().toString(), role: 'user', type: 'text', content: input.length > 50 ? "Transcript uploaded" : `Input: "${input}"` });
-      addMessage({ 
-        id: (Date.now() + 1).toString(), 
-        role: 'assistant', 
-        type: 'quote-select', 
-        data: quotes 
-      });
+      if (quotes.length === 1) {
+        // Auto-select if only one quote is provided/extracted
+        const q = quotes[0];
+        setConfig(prev => ({ ...prev, quote: q.text }));
+        setStep('voice');
+        addMessage({ 
+          id: (Date.now() + 1).toString(), 
+          role: 'assistant', 
+          type: 'text', 
+          content: `Got it! I'll use that quote. Now, let's choose a voice for the narration.` 
+        });
+        addMessage({ id: (Date.now() + 2).toString(), role: 'assistant', type: 'voice-select' });
+      } else {
+        setStep('quote');
+        addMessage({ 
+          id: (Date.now() + 1).toString(), 
+          role: 'assistant', 
+          type: 'quote-select', 
+          data: quotes 
+        });
+      }
 
     } catch (e: any) {
       console.error(e);
@@ -736,55 +1287,62 @@ const App = () => {
   };
 
   const handleCopilotCommand = async (text: string) => {
-    // If we are at the start, treat text as source input
+    const lowerText = text.toLowerCase().trim();
+    
+    // Client-side quick checks to save tokens
+    if (lowerText === 'restart' || lowerText === 'reset') {
+      window.location.reload();
+      return;
+    }
+
     if (step === 'source') {
       handleProcessSource(text);
       return;
     }
 
-    // Otherwise, use AI to interpret command
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const prompt = `
-      User says: "${text}".
-      Current Step: ${step}.
-      Current Config: ${JSON.stringify(config)}.
-      Available Themes: ${THEMES.map(t => t.id).join(', ')}.
-      Available Moods: ${MOODS.join(', ')}.
-      
-      Interpret the user's intent. 
-      If they want to change a setting (voice, theme, mood, etc.), return a JSON object with "updates" (Partial<Config>) and "response" (string).
-      If they want to proceed, return "action": "next".
-      If they want to restart, return "action": "restart".
-      
-      JSON Only. No markdown.
-    `;
     
     try {
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt
+        model: 'gemini-3-flash-preview',
+        contents: `User: "${text}"`,
+        config: { 
+            systemInstruction: `Interpret user intent for SermonClip AI. 
+              Current Step: ${step}. 
+              Current Config: ${JSON.stringify(config)}.
+              Themes: ${THEMES.map(t => t.id).join(', ')}.
+              Moods: ${MOODS.join(', ')}.
+              Return JSON with "updates" (Partial Config) and "response" (string).`,
+            maxOutputTokens: 256,
+            responseMimeType: "application/json"
+        }
       });
       
-      let cleanText = response.text?.trim() || "[]";
-      if (cleanText.startsWith('```json')) cleanText = cleanText.replace(/```json/g, '').replace(/```/g, '');
-      const result = JSON.parse(cleanText);
+      const result = safeParseJSON<any>(response.text);
 
       addMessage({ id: Date.now().toString(), role: 'user', type: 'text', content: text });
 
-      if (result.updates) {
+      if (result && result.updates) {
         setConfig(prev => ({ ...prev, ...result.updates }));
         addMessage({ id: (Date.now()+1).toString(), role: 'assistant', type: 'text', content: (result.response as string) || "Updated." });
-      } else if (result.action === 'restart') {
+      } else if (result && result.action === 'restart') {
         window.location.reload();
       } else {
         addMessage({ id: (Date.now()+1).toString(), role: 'assistant', type: 'text', content: "I didn't quite catch that. Could you clarify?" });
       }
     } catch(e) {
       console.error(e);
+      addMessage({ id: (Date.now()+1).toString(), role: 'assistant', type: 'text', content: "Sorry, I had trouble understanding that." });
     }
   };
 
   const generateClip = async () => {
+    // Check key before Veo call
+    if (window.aistudio && !(await window.aistudio.hasSelectedApiKey())) {
+      setNeedsApiKey(true);
+      return;
+    }
+
     setLoading(true);
     setLoadingText('Recording voiceover...');
     setStep('generating');
@@ -797,7 +1355,8 @@ const App = () => {
       const theme = THEMES.find(t => t.id === config.themeId);
 
       // --- STEP 1: GENERATE AUDIO FIRST TO GET DURATION ---
-      const audioPromise = ai.models.generateContent({
+      // Wrapped in retry logic to handle potential 429 quota errors
+      const audioResp = await retryOperation<GenerateContentResponse>(() => ai.models.generateContent({
         model: 'gemini-2.5-flash-preview-tts',
         contents: `Read this quote with a ${config.mood.toLowerCase()}, ${config.voice} voice: "${config.quote}"`,
         config: {
@@ -810,10 +1369,8 @@ const App = () => {
             }
           }
         }
-      });
+      }));
       
-      const audioResp = await audioPromise;
-
       let audioBlobUrl = '';
       let audioDurationSeconds = 0;
       let subtitles: SubtitleSegment[] = [];
@@ -826,10 +1383,7 @@ const App = () => {
         const sampleRate = 24000;
         const numChannels = 1;
         const bytesPerSample = 2; // 16-bit
-        audioDurationSeconds = pcmData.length / (sampleRate * numChannels * bytesPerSample); // 2 bytes per sample (16-bit) but we are using Uint8Array so it is bytes directly? 
-        // No, pcmData is Uint8Array of bytes. 
-        // Total bytes / (24000 samples/sec * 2 bytes/sample) = seconds.
-        audioDurationSeconds = pcmData.length / 48000;
+        audioDurationSeconds = pcmData.length / 48000; // 24000 * 2 = 48000 bytes/sec
 
         const wavHeader = createWavHeader(pcmData.length);
         const wavBytes = new Uint8Array(wavHeader.byteLength + pcmData.byteLength);
@@ -849,98 +1403,124 @@ const App = () => {
       // --- STEP 2: STORYBOARD & CALCULATE CLIPS NEEDED ---
       setLoadingText(`Storyboarding visuals for ${Math.ceil(audioDurationSeconds)}s of audio...`);
 
-      // Veo clips are typically short (assume ~5-6 seconds useful length for smooth transition)
-      const CLIP_LENGTH = 5; 
+      // Optimized: Increase clip length to 8s to reduce number of video generations (saves significant quota)
+      const CLIP_LENGTH = 8; 
       const clipsNeeded = Math.ceil(audioDurationSeconds / CLIP_LENGTH);
       
-      // Generate prompts for ALL clips at once using Gemini Flash to ensure consistency
-      const storyboardResp = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `
-          Role: Cinematic Storyteller.
-          Task: Create ${clipsNeeded} distinct but visually cohesive video prompts for Veo.
-          Theme: ${theme?.name} (${theme?.visualDetails})
-          Mood: ${config.mood}
-          Format: ${config.aspectRatio}
-          
-          Guidelines:
-          - The prompts should form a sequence (e.g., establishing shot -> detail -> action).
-          - Use visual metaphors matching: "${config.quote.substring(0, 100)}..."
-          - Ensure they look like they belong in the same video.
-          - No text in video.
-          
-          Return ONLY a JSON array of strings. 
-          Example: ["Wide shot of...", "Close up of..."]
-        `
-      });
-
-      let cleanPromptText = storyboardResp.text?.trim() || "[]";
-      if (cleanPromptText.startsWith('```json')) cleanPromptText = cleanPromptText.replace(/```json/g, '').replace(/```/g, '');
-      const prompts = JSON.parse(cleanPromptText);
-      
-      // Fallback if AI returns fewer prompts than needed
-      while (prompts.length < clipsNeeded) {
-        prompts.push(prompts[0]);
-      }
-
-      // --- STEP 3: PARALLEL VIDEO GENERATION ---
-      setLoadingText(`Filming ${clipsNeeded} scenes simultaneously...`);
-
-      const videoPromises = prompts.map(async (prompt: string) => {
-          let videoOp = await ai.models.generateVideos({
-            model: 'veo-3.1-fast-generate-preview',
-            prompt: prompt,
-            config: {
-              numberOfVideos: 1,
-              resolution: config.resolution,
-              aspectRatio: config.aspectRatio
+      const storyboardResp = await retryOperation<GenerateContentResponse>(() => ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: `Create ${clipsNeeded} cohesive video prompts for: "${config.quote}"`,
+        config: { 
+            systemInstruction: `You are a cinematic director. Theme: ${theme?.name} (${theme?.visualDetails}). Mood: ${config.mood}. Format: ${config.aspectRatio}. Return a JSON array of strings. No text in video.`,
+            maxOutputTokens: 1024,
+            responseMimeType: "application/json",
+            responseSchema: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
             }
-          });
+        }
+      }));
 
-          // Poll Video
-          let operation = videoOp;
-          while (operation.done !== true) {
-             await new Promise(r => setTimeout(r, 4000)); 
-             operation = await ai.operations.getVideosOperation({ operation: operation });
-          }
-          
-          if (operation.error) throw new Error(String(operation.error.message));
-          
-          const videoUri = operation.response?.generatedVideos?.[0]?.video?.uri;
-          if (!videoUri) throw new Error("Missing video URI");
-
-          const vidRes = await fetch(`${videoUri}&key=${process.env.API_KEY}`);
-          const vidBlob = await vidRes.blob();
-          return URL.createObjectURL(vidBlob);
-      });
-
-      const videoUrls = await Promise.all(videoPromises);
-
-      setVideoData({ sequence: videoUrls, audioUrl: audioBlobUrl, subtitles });
-      setStep('done');
-
-      // 4. Generate Suggestion
-      const suggestionResp = await ai.models.generateContent({
-         model: 'gemini-2.5-flash',
-         contents: `
-           Based on the quote "${config.quote}" and the current theme "${theme?.name}", 
-           suggest ONE creative variation (different theme, voice, or mood) that might also work well.
-           Return JSON: { "summary": "Try x...", "reason": "Because...", "updates": {...config updates} }
-           No markdown.
-         `
-      });
-      let suggText = suggestionResp.text?.trim() || "{}";
-      if (suggText.startsWith('```json')) suggText = suggText.replace(/```json/g, '').replace(/```/g, '');
-      else if (suggText.startsWith('```')) suggText = suggText.replace(/```/g, '');
+      let prompts: string[] = safeParseJSON<string[]>(storyboardResp.text) || [];
       
-      let suggestion;
-      try {
-        suggestion = JSON.parse(suggText);
-      } catch (e) {
-        suggestion = { summary: "Try a different theme", reason: "For variety", updates: {} };
+      // Validation & Fallback: Ensure prompts is a valid array of strings
+      if (!Array.isArray(prompts) || prompts.length === 0) {
+         // Create a solid fallback based on current config if AI fails
+         console.warn("AI Storyboard failed or returned empty. Using fallback.");
+         const fallbackPrompt = `Cinematic video representing ${config.mood} mood. ${theme?.visualDetails}. High quality, ${config.resolution}.`;
+         prompts = [fallbackPrompt];
       }
+
+      // Ensure every element is a string
+      prompts = prompts.map(p => typeof p === 'string' ? p : JSON.stringify(p));
       
-      addMessage({ id: Date.now().toString(), role: 'assistant', type: 'suggestion', data: suggestion });
+      // Fill gaps if AI returns fewer prompts than needed using a loop of existing prompts
+      // This is crucial to avoid "undefined" prompts later
+      while (prompts.length < clipsNeeded) {
+        const filler = prompts.length > 0 ? prompts[prompts.length % prompts.length] : `Cinematic video, ${config.mood} atmosphere`;
+        prompts.push(filler);
+      }
+
+      // --- STEP 3: SEQUENTIAL VIDEO GENERATION ---
+      setLoadingText(`Filming ${clipsNeeded} scenes sequentially to manage resources...`);
+
+      const videoClips: VideoClip[] = [];
+
+      // Execute sequentially to avoid rate limits (429 Resource Exhausted)
+      for (let i = 0; i < prompts.length; i++) {
+        let prompt = prompts[i];
+        
+        // Final sanity check
+        if (!prompt || typeof prompt !== 'string' || prompt.trim() === "") {
+           console.warn(`Skipping invalid prompt at index ${i}`);
+           // Use a fallback prompt if the current one is invalid to keep the sequence
+           prompt = `Cinematic video, ${config.mood} atmosphere, ${theme?.name} style`;
+        }
+
+        setLoadingText(`Filming scene ${i + 1} of ${prompts.length}...`);
+
+        try {
+          // Add a deliberate delay between clips to prevent hitting QPM (Queries Per Minute) limit
+          if (i > 0) await delay(5000); 
+
+          const videoUrl = await retryOperation(async () => {
+             let videoOp = await ai.models.generateVideos({
+              model: 'veo-3.1-fast-generate-preview',
+              prompt: prompt, // Use guaranteed valid prompt
+              config: {
+                numberOfVideos: 1,
+                resolution: config.resolution,
+                aspectRatio: config.aspectRatio
+              }
+            });
+
+            // Poll Video
+            let operation = videoOp;
+            while (operation.done !== true) {
+               await delay(5000); // Polling delay
+               operation = await ai.operations.getVideosOperation({ operation: operation });
+            }
+            
+            if (operation.error) throw new Error(String(operation.error.message));
+            
+            const videoUri = operation.response?.generatedVideos?.[0]?.video?.uri;
+            if (!videoUri) throw new Error("Missing video URI");
+
+            const vidRes = await fetch(`${videoUri}&key=${process.env.API_KEY}`);
+            if (!vidRes.ok) throw new Error("Failed to download video bytes");
+            const vidBlob = await vidRes.blob();
+            return URL.createObjectURL(vidBlob);
+          }, 4, 10000); // 4 Retries, start at 10s backoff (very robust for 429s)
+
+          videoClips.push({
+            id: Date.now().toString() + i,
+            url: videoUrl,
+            prompt: prompt
+          });
+        } catch (e) {
+          console.error(`Failed to generate clip ${i+1}`, e);
+          // Reuse previous if available
+          if (videoClips.length > 0) {
+            videoClips.push({
+                id: Date.now().toString() + i + "_fallback",
+                url: videoClips[videoClips.length - 1].url,
+                prompt: videoClips[videoClips.length - 1].prompt
+            });
+          } else if (i === prompts.length - 1 && videoClips.length === 0) {
+             throw e; // Throw if ALL failed
+          }
+        }
+      }
+
+      if (videoClips.length === 0) {
+        throw new Error("Failed to generate any video clips. Please try again later.");
+      }
+
+      setVideoData({ clips: videoClips, audioUrl: audioBlobUrl, subtitles });
+      setStep('done');
+      
+      // Removed automatic suggestion generation to conserve tokens.
+      addMessage({ id: Date.now().toString(), role: 'assistant', type: 'text', content: "Video generated! You can download it, or ask me to help refine it." });
 
     } catch (err: unknown) {
       console.error(err);
@@ -964,6 +1544,36 @@ const App = () => {
       
       {/* LEFT COLUMN: Conversational Interface */}
       <div className="w-full md:w-1/2 lg:w-5/12 flex flex-col border-r border-gray-800 bg-[#131316]">
+        
+        {/* API Key Guard Overlay */}
+        {needsApiKey && (
+          <div className="absolute inset-0 z-[60] bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-8 text-center">
+            <div className="w-16 h-16 rounded-2xl bg-yellow-500/20 flex items-center justify-center mb-6 border border-yellow-500/50">
+              <i className="fas fa-key text-yellow-500 text-2xl"></i>
+            </div>
+            <h2 className="text-xl font-bold text-white mb-2">Paid API Key Required</h2>
+            <p className="text-gray-400 text-sm mb-6 max-w-xs">
+              This app uses Veo for cinematic video generation, which requires a paid Google Cloud project API key.
+            </p>
+            <div className="space-y-3 w-full max-w-xs">
+              <button 
+                onClick={handleConnectKey}
+                className="w-full py-3 bg-yellow-600 hover:bg-yellow-500 text-white font-bold rounded-lg transition-all shadow-lg"
+              >
+                Select API Key
+              </button>
+              <a 
+                href="https://ai.google.dev/gemini-api/docs/billing" 
+                target="_blank" 
+                rel="noopener noreferrer"
+                className="block text-xs text-blue-400 hover:underline"
+              >
+                Learn about Gemini API billing
+              </a>
+            </div>
+          </div>
+        )}
+
         {/* Header */}
         <div className="p-4 border-b border-gray-800 flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-purple-600 flex items-center justify-center">
@@ -1115,7 +1725,7 @@ const App = () => {
       </div>
 
       {/* RIGHT COLUMN: Preview & Player */}
-      <div className="hidden md:flex flex-1 bg-black items-center justify-center relative p-8">
+      <div className="hidden md:flex flex-1 flex-col bg-black items-center justify-center relative p-8">
         
         {loading && (
           <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center text-center p-8">
@@ -1125,6 +1735,20 @@ const App = () => {
             </h2>
             <p className="text-gray-400 animate-pulse">{loadingText}</p>
           </div>
+        )}
+
+        {isExporting && (
+           <div className="absolute inset-0 z-50 bg-black/90 flex flex-col items-center justify-center p-8">
+             <div className="w-12 h-12 border-2 border-green-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+             <p className="text-green-400">Rendering & Mixing Video... Please wait.</p>
+             <p className="text-xs text-gray-500 mt-2">Do not close this tab.</p>
+             <button 
+                onClick={cancelExport}
+                className="mt-4 px-4 py-2 bg-red-900/50 hover:bg-red-800 text-red-200 text-xs rounded border border-red-700"
+             >
+                Stop Export (Reload)
+             </button>
+           </div>
         )}
 
         {error && (
@@ -1142,13 +1766,16 @@ const App = () => {
 
         {/* Player Container */}
         <div 
-          className="relative bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-800 flex flex-col items-center justify-center"
+          className="relative bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-800 flex flex-col items-center justify-center flex-shrink-0"
           style={{
             aspectRatio: config.aspectRatio === '9:16' ? '9/16' : '16/9',
-            height: config.aspectRatio === '9:16' ? '80vh' : 'auto',
+            height: config.aspectRatio === '9:16' ? '70vh' : 'auto',
             width: config.aspectRatio === '16:9' ? '80%' : 'auto'
           }}
         >
+          {/* Hidden Canvas for Export */}
+          <canvas ref={exportCanvasRef} className="hidden" />
+
           {videoData ? (
             <>
               {/* HTML Overlay for Text - No Hallucinations */}
@@ -1185,7 +1812,7 @@ const App = () => {
 
               <video 
                 ref={videoRef}
-                src={videoData.sequence[currentClipIndex]} 
+                src={videoData.clips[currentClipIndex].url} 
                 className="w-full h-full object-cover" 
                 playsInline
                 muted // Muted to allow separate audio track
@@ -1200,9 +1827,9 @@ const App = () => {
               />
               
               {/* Clip Indicator */}
-              {videoData.sequence.length > 1 && (
+              {videoData.clips.length > 1 && (
                 <div className="absolute top-4 left-4 z-20 flex gap-1">
-                  {videoData.sequence.map((_, idx) => (
+                  {videoData.clips.map((_, idx) => (
                     <div 
                       key={idx} 
                       className={`h-1 rounded-full transition-all ${idx === currentClipIndex ? 'w-6 bg-white' : 'w-2 bg-white/30'}`}
@@ -1223,19 +1850,30 @@ const App = () => {
 
               {/* Download Actions */}
               <div className="absolute top-4 right-4 z-30 flex flex-col gap-2">
+                 <button 
+                   onClick={handleExport}
+                   disabled={isExporting}
+                   className="w-10 h-10 rounded-full bg-blue-600/80 backdrop-blur-sm border border-white/10 hover:bg-blue-600 flex items-center justify-center text-white transition-all tooltip-trigger shadow-lg"
+                   title="Download Full Video (Audio+Video+Text)"
+                 >
+                   <i className="fas fa-download"></i>
+                 </button>
+                 
+                 <div className="h-px w-8 bg-white/20 my-1 mx-auto"></div>
+
                  <a 
-                   href={videoData.sequence[0]} 
-                   download="clip_01.mp4"
-                   className="w-10 h-10 rounded-full bg-black/40 backdrop-blur-sm border border-white/10 hover:bg-black/60 flex items-center justify-center text-white transition-all tooltip-trigger"
-                   title="Download First Clip"
+                   href={videoData.clips[currentClipIndex].url} 
+                   download={`clip_${currentClipIndex}.mp4`}
+                   className="w-8 h-8 rounded-full bg-black/40 backdrop-blur-sm border border-white/10 hover:bg-black/60 flex items-center justify-center text-white text-xs transition-all tooltip-trigger"
+                   title="Download Raw Video Asset"
                  >
                    <i className="fas fa-video"></i>
                  </a>
                  <a 
                    href={videoData.audioUrl} 
                    download="sermon-clip-audio.wav"
-                   className="w-10 h-10 rounded-full bg-black/40 backdrop-blur-sm border border-white/10 hover:bg-black/60 flex items-center justify-center text-white transition-all tooltip-trigger"
-                   title="Download Audio"
+                   className="w-8 h-8 rounded-full bg-black/40 backdrop-blur-sm border border-white/10 hover:bg-black/60 flex items-center justify-center text-white text-xs transition-all tooltip-trigger"
+                   title="Download Raw Audio Asset"
                  >
                    <i className="fas fa-music"></i>
                  </a>
@@ -1251,6 +1889,19 @@ const App = () => {
             </div>
           )}
         </div>
+
+        {/* Timeline Editor */}
+        {videoData && (
+            <TimelineEditor 
+                clips={videoData.clips}
+                currentClipIndex={currentClipIndex}
+                onClipSelect={setCurrentClipIndex}
+                onReorder={handleReorderClips}
+                onRegenerate={handleRegenerateClip}
+                onSuggest={handleAISuggestion}
+                isRegeneratingIndex={isRegeneratingIndex}
+            />
+        )}
       </div>
     </div>
   );
